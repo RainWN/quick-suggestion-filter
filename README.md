@@ -1,6 +1,6 @@
 # Quick Suggestion Filter
 
-中文文档: README.zh-CN.md
+[中文文档](README.zh-CN.md)
 
 Quick Suggestion Filter is a VS Code extension that lets you filter native code completions by category using the keyboard.
 

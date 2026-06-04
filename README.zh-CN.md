@@ -1,6 +1,6 @@
 ﻿# Quick Suggestion Filter
 
-English document: README.md
+[English document](README.md)
 
 Quick Suggestion Filter 是一个 VS Code 扩展，支持使用键盘按分类快速筛选原生代码补全结果。
 
