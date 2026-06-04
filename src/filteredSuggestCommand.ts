@@ -48,7 +48,7 @@ export function registerFilteredSuggestCommand(
         `Triggering native suggest for category=${targetCategoryId}.`
       );
       await vscode.commands.executeCommand("editor.action.triggerSuggest");
-      editorBottomTabsDecorationController.show();
+      editorBottomTabsDecorationController.showImmediate();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       outputChannel.appendLine(`[error] Native suggest trigger failed: ${message}`);

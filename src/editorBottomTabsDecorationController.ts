@@ -3,6 +3,7 @@ import {
   SuggestionCategoryIconId,
   SuggestionFilterService,
 } from "./suggestionFilterService";
+import { SuggestKindSettingsController } from "./suggestKindSettingsController";
 
 interface TabsBarPalette {
   background: string;
@@ -39,6 +40,9 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   private static readonly tabWidth = 70;
   private static readonly tabHeight = 36;
   private static readonly tabGap = 4;
+  private static readonly base64Chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  private static readonly escapedLabelCache = new Map<string, string>();
   private readonly topTabsDecorationType = vscode.window.createTextEditorDecorationType({
     rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     before: {
@@ -49,10 +53,9 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   private isVisible = false;
   private isSuggestRestarting = false;
   private tabsVisibleContext = false;
-  private refreshTimer?: NodeJS.Timeout;
-  private lateRefreshTimer?: NodeJS.Timeout;
-  private layoutRefreshIntervalTimer?: NodeJS.Timeout;
-  private layoutRefreshSyncTimer?: NodeJS.Timeout;
+  private tabsPollTimer?: NodeJS.Timeout;
+  private tabsDeferredTimer?: NodeJS.Timeout;
+  private tabsDirty = false;
   private tabsBarCacheKey?: string;
   private tabsBarCacheData?: TabsBarRenderData;
   private triggerAnchorState?: TriggerAnchorState;
@@ -61,8 +64,20 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   private viewportCapacityLayoutKey?: string;
   private maxVisibleLineSlots?: number;
   private lastAppliedLayoutKey?: string;
+  private lastIdleTopVisibleLine?: number;
+  private lastIdleVisibleLineSlots?: number;
+  private svgTemplateCacheKey?: string;
+  private svgTemplateCache?: string;
+  private cachedLineHeightPx?: number;
+  private cachedBottomPaddingPx?: number;
+  private configCacheLayoutKey?: string;
+  private showDeferredAnchor?: vscode.Position;
+  private showDeferredTimer?: NodeJS.Timeout;
 
-  public constructor(private readonly filterService: SuggestionFilterService) {
+  public constructor(
+    private readonly filterService: SuggestionFilterService,
+    private readonly settingsController?: SuggestKindSettingsController
+  ) {
     this.setTabsVisibleContext(false);
 
     const activeEditor = vscode.window.activeTextEditor;
@@ -72,6 +87,7 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
 
     this.subscriptions.push(
       vscode.window.onDidChangeActiveTextEditor((editor) => {
+        this.invalidateConfigCache();
         if (editor) {
           this.updateViewportCapacityHistory(editor);
         }
@@ -93,7 +109,7 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
           event.kind === vscode.TextEditorSelectionChangeKind.Keyboard ||
           event.kind === vscode.TextEditorSelectionChangeKind.Command
         ) {
-          this.scheduleTabsLayoutRefresh(0);
+          this.scheduleDeferredTabsRefresh(0);
           return;
         }
 
@@ -101,7 +117,7 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
       }),
       vscode.workspace.onDidChangeTextDocument((event) => {
         if (this.isVisible && vscode.window.activeTextEditor?.document === event.document) {
-          this.scheduleTabsLayoutRefresh(0);
+          this.scheduleDeferredTabsRefresh(0);
           this.refresh();
         }
       }),
@@ -112,6 +128,7 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
 
         this.updateViewportCapacityHistory(event.textEditor);
         if (this.isVisible) {
+          this.markTabsDirty();
           this.updatePinnedOffsetForViewportChange(event.textEditor);
           this.refresh();
         }
@@ -128,6 +145,7 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
           return;
         }
 
+        this.invalidateConfigCache();
         this.resetViewportCapacityHistory(activeEditor);
         this.invalidateTabsBarCache();
         if (this.isVisible && activeEditor) {
@@ -145,6 +163,30 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   }
 
   public show(anchorPosition?: vscode.Position): void {
+    const activeEditor = vscode.window.activeTextEditor;
+    this.showDeferredAnchor =
+      anchorPosition ?? activeEditor?.selection.active;
+
+    if (this.showDeferredTimer) {
+      return;
+    }
+
+    this.showDeferredTimer = setTimeout(() => {
+      this.showDeferredTimer = undefined;
+      this.executeShow(this.showDeferredAnchor);
+    }, 0);
+  }
+
+  public showImmediate(anchorPosition?: vscode.Position): void {
+    if (this.showDeferredTimer) {
+      clearTimeout(this.showDeferredTimer);
+      this.showDeferredTimer = undefined;
+    }
+
+    this.executeShow(anchorPosition);
+  }
+
+  private executeShow(anchorPosition?: vscode.Position): void {
     const wasVisible = this.isVisible;
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor) {
@@ -167,13 +209,13 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     this.setTabsVisibleContext(true);
     this.refresh();
     if (!wasVisible) {
-      this.scheduleRefresh(0);
-      this.scheduleLateRefresh(48);
-      this.startLayoutRefreshInterval();
+      this.markTabsDirty();
+      this.scheduleDeferredTabsRefresh(48);
+      this.startTabsPolling();
       return;
     }
 
-    this.scheduleLateRefresh(24);
+    this.scheduleDeferredTabsRefresh(24);
   }
 
   public beginSuggestWidgetRestart(): void {
@@ -190,14 +232,20 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     this.pinnedVerticalOffsetPx = undefined;
     this.pinnedViewportTopLine = undefined;
     this.lastAppliedLayoutKey = undefined;
+    this.lastIdleTopVisibleLine = undefined;
+    this.lastIdleVisibleLineSlots = undefined;
+    this.showDeferredAnchor = undefined;
+    if (this.showDeferredTimer) {
+      clearTimeout(this.showDeferredTimer);
+      this.showDeferredTimer = undefined;
+    }
     this.setTabsVisibleContext(false);
-    this.clearRefreshTimers();
-    this.clearTabsLayoutRefreshInterval();
-    this.clearTabsLayoutRefreshTimer();
+    this.clearAllTabsTimers();
     this.clearTopTabsDecorations();
 
     if (options?.resetCategory !== false && !this.isSuggestRestarting) {
       this.filterService.resetSelectedCategoryToAll();
+      void this.settingsController?.syncCategory(true, "all", true);
     }
   }
 
@@ -266,59 +314,25 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
       return this.tabsBarCacheData;
     }
 
-    const tabs = this.filterService.getCategoryTabs();
-    const palette = this.getTabsBarPalette();
-    const baseHeightPx = this.getVisualTabsBarHeightPx();
-    const widthPx =
-      EditorBottomTabsDecorationController.barPaddingX * 2 +
-      tabs.length * EditorBottomTabsDecorationController.tabWidth +
-      (tabs.length - 1) * EditorBottomTabsDecorationController.tabGap;
-    const heightPx = verticalOffsetPx + baseHeightPx;
-    const selectedCategoryId = this.filterService.getSelectedCategoryId();
-
-    const tabsMarkup: string[] = [];
-    for (let index = 0; index < tabs.length; index += 1) {
-      const tab = tabs[index];
-      const tabX =
-        EditorBottomTabsDecorationController.barPaddingX +
-        index *
-          (EditorBottomTabsDecorationController.tabWidth +
-            EditorBottomTabsDecorationController.tabGap);
-      const tabY = verticalOffsetPx + EditorBottomTabsDecorationController.barPaddingY;
-      const isSelected = tab.id === selectedCategoryId;
-      const iconColor = isSelected
-        ? palette.selectedForeground
-        : palette.foreground;
-      const labelColor = isSelected
-        ? palette.selectedForeground
-        : palette.mutedForeground;
-
-      if (isSelected) {
-        tabsMarkup.push(
-          `<rect x="${tabX}" y="${tabY}" width="${EditorBottomTabsDecorationController.tabWidth}" height="${EditorBottomTabsDecorationController.tabHeight}" rx="10" fill="${palette.selectedBackground}" stroke="${palette.selectedBorder}" stroke-width="1.2" />`
-        );
-      }
-
-      tabsMarkup.push(
-        this.renderTabIcon(
-          tab.icon,
-          tabX + EditorBottomTabsDecorationController.tabWidth / 2,
-          tabY + 12,
-          iconColor
-        )
-      );
-      tabsMarkup.push(
-        `<text x="${tabX + EditorBottomTabsDecorationController.tabWidth / 2}" y="${tabY + 29}" text-anchor="middle" font-size="10.5" font-family="Segoe UI, Arial, sans-serif" font-weight="${isSelected ? "700" : "600"}" fill="${labelColor}">${this.escapeXml(tab.englishLabel)}</text>`
-      );
+    const templateKey = `${this.filterService.getSelectedCategoryId()}|${vscode.window.activeColorTheme.kind}`;
+    if (this.svgTemplateCacheKey !== templateKey || !this.svgTemplateCache) {
+      this.svgTemplateCache = this.buildSvgTemplate();
+      this.svgTemplateCacheKey = templateKey;
     }
 
-    const svg = [
-      `<svg xmlns="http://www.w3.org/2000/svg" width="${widthPx}" height="${heightPx}" viewBox="0 0 ${widthPx} ${heightPx}" fill="none">`,
-      `<rect x="0.5" y="${verticalOffsetPx + 0.5}" width="${widthPx - 1}" height="${baseHeightPx - 1}" rx="16" fill="${palette.background}" stroke="${palette.border}" />`,
-      ...tabsMarkup,
-      "</svg>",
-    ].join("");
-    const svgBase64 = Buffer.from(svg, "utf8").toString("base64");
+    const baseHeightPx = this.getVisualTabsBarHeightPx();
+    const svg = this.svgTemplateCache.replace(
+      /__VO(-?\d+\.?\d*)__/g,
+      (_, addend) => String(verticalOffsetPx + parseFloat(addend))
+    );
+    const svgBase64 = EditorBottomTabsDecorationController.encodeBase64(svg);
+
+    const widthPx =
+      EditorBottomTabsDecorationController.barPaddingX * 2 +
+      this.filterService.getCategoryTabs().length * EditorBottomTabsDecorationController.tabWidth +
+      (this.filterService.getCategoryTabs().length - 1) * EditorBottomTabsDecorationController.tabGap;
+    const heightPx = verticalOffsetPx + baseHeightPx;
+
     const renderData: TabsBarRenderData = {
       uri: vscode.Uri.parse(`data:image/svg+xml;base64,${svgBase64}`),
       widthPx,
@@ -328,6 +342,64 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     this.tabsBarCacheKey = cacheKey;
     this.tabsBarCacheData = renderData;
     return renderData;
+  }
+
+  private buildSvgTemplate(): string {
+    const tabs = this.filterService.getCategoryTabs();
+    const palette = this.getTabsBarPalette();
+    const baseHeightPx = this.getVisualTabsBarHeightPx();
+    const widthPx =
+      EditorBottomTabsDecorationController.barPaddingX * 2 +
+      tabs.length * EditorBottomTabsDecorationController.tabWidth +
+      (tabs.length - 1) * EditorBottomTabsDecorationController.tabGap;
+    const selectedCategoryId = this.filterService.getSelectedCategoryId();
+
+    const parts: string[] = [
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${widthPx}" height="__VO${baseHeightPx}__" viewBox="0 0 ${widthPx} __VO${baseHeightPx}__" fill="none">`,
+      `<rect x="0.5" y="__VO0.5__" width="${widthPx - 1}" height="${baseHeightPx - 1}" rx="16" fill="${palette.background}" stroke="${palette.border}" />`,
+    ];
+
+    for (let index = 0; index < tabs.length; index += 1) {
+      const tab = tabs[index];
+      const tabX =
+        EditorBottomTabsDecorationController.barPaddingX +
+        index *
+          (EditorBottomTabsDecorationController.tabWidth +
+            EditorBottomTabsDecorationController.tabGap);
+      const tabCenterX =
+        tabX + EditorBottomTabsDecorationController.tabWidth / 2;
+      const isSelected = tab.id === selectedCategoryId;
+      const iconColor = isSelected
+        ? palette.selectedForeground
+        : palette.foreground;
+      const labelColor = isSelected
+        ? palette.selectedForeground
+        : palette.mutedForeground;
+
+      const tabVO = EditorBottomTabsDecorationController.barPaddingY;
+      const iconVO = EditorBottomTabsDecorationController.barPaddingY + 12;
+      const textVO = EditorBottomTabsDecorationController.barPaddingY + 29;
+
+      if (isSelected) {
+        parts.push(
+          `<rect x="${tabX}" y="__VO${tabVO}__" width="${EditorBottomTabsDecorationController.tabWidth}" height="${EditorBottomTabsDecorationController.tabHeight}" rx="10" fill="${palette.selectedBackground}" stroke="${palette.selectedBorder}" stroke-width="1.2" />`
+        );
+      }
+
+      parts.push(
+        this.renderTabIcon(tab.icon, tabCenterX, 0, iconColor).replace(
+          `translate(${tabCenterX} 0)`,
+          `translate(${tabCenterX} __VO${iconVO}__)`
+        )
+      );
+
+      parts.push(
+        `<text x="${tabCenterX}" y="__VO${textVO}__" text-anchor="middle" font-size="10.5" font-family="Segoe UI, Arial, sans-serif" font-weight="${isSelected ? "700" : "600"}" fill="${labelColor}">${EditorBottomTabsDecorationController.escapeXml(tab.englishLabel)}</text>`
+      );
+    }
+
+    parts.push("</svg>");
+    return parts.join("");
   }
 
   private getVisualTabsBarHeightPx(): number {
@@ -457,15 +529,54 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   private invalidateTabsBarCache(): void {
     this.tabsBarCacheKey = undefined;
     this.tabsBarCacheData = undefined;
+    this.svgTemplateCacheKey = undefined;
+    this.svgTemplateCache = undefined;
+    EditorBottomTabsDecorationController.escapedLabelCache.clear();
   }
 
-  private escapeXml(value: string): string {
-    return value
+  private static escapeXml(value: string): string {
+    let cached =
+      EditorBottomTabsDecorationController.escapedLabelCache.get(value);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    cached = value
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/\"/g, "&quot;")
+      .replace(/"/g, "&quot;")
       .replace(/'/g, "&apos;");
+    EditorBottomTabsDecorationController.escapedLabelCache.set(value, cached);
+    return cached;
+  }
+
+  private static encodeBase64(input: string): string {
+    const bytes = new TextEncoder().encode(input);
+    const chars =
+      EditorBottomTabsDecorationController.base64Chars;
+    let result = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+      result += chars[bytes[i] >> 2];
+      result +=
+        chars[
+          ((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)
+        ];
+      if (i + 1 >= bytes.length) {
+        result += "==";
+        break;
+      }
+      result +=
+        chars[
+          ((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)
+        ];
+      if (i + 2 >= bytes.length) {
+        result += "=";
+        break;
+      }
+      result += chars[bytes[i + 2] & 63];
+    }
+    return result;
   }
 
   private getAnchorRange(editor: vscode.TextEditor): vscode.Range {
@@ -662,7 +773,6 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
       .getConfiguration("window")
       .get<number>("zoomLevel", 0);
     return [
-      editor.document.uri.toString(),
       editor.viewColumn ?? -1,
       this.getEffectiveLineHeight(editor),
       this.getEditorBottomPaddingPx(editor),
@@ -671,6 +781,24 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   }
 
   private getEffectiveLineHeight(editor: vscode.TextEditor): number {
+    const layoutKey = this.getEditorConfigCacheKey(editor);
+    if (this.configCacheLayoutKey !== layoutKey || this.cachedLineHeightPx === undefined) {
+      this.refreshConfigCache(editor, layoutKey);
+    }
+
+    return this.cachedLineHeightPx!;
+  }
+
+  private getEditorConfigCacheKey(editor: vscode.TextEditor): string {
+    return `${editor.document.uri.toString()}|${editor.viewColumn ?? -1}`;
+  }
+
+  private refreshConfigCache(
+    editor: vscode.TextEditor,
+    layoutKey?: string
+  ): void {
+    this.configCacheLayoutKey =
+      layoutKey ?? this.getEditorConfigCacheKey(editor);
     const editorConfiguration = vscode.workspace.getConfiguration(
       "editor",
       editor.document.uri
@@ -678,79 +806,90 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     const configuredLineHeight = editorConfiguration.get<number>("lineHeight", 0);
     const fontSize = editorConfiguration.get<number>("fontSize", 14);
     if (configuredLineHeight > 8) {
-      return configuredLineHeight;
+      this.cachedLineHeightPx = configuredLineHeight;
+    } else if (configuredLineHeight > 0) {
+      this.cachedLineHeightPx = Math.round(fontSize * configuredLineHeight);
+    } else {
+      this.cachedLineHeightPx = Math.max(fontSize + 8, Math.round(fontSize * 1.5));
     }
 
-    if (configuredLineHeight > 0) {
-      return Math.round(fontSize * configuredLineHeight);
-    }
-
-    return Math.max(fontSize + 8, Math.round(fontSize * 1.5));
+    const padding = editorConfiguration.get<{ bottom?: number }>("padding");
+    this.cachedBottomPaddingPx = Math.max(0, padding?.bottom ?? 0);
   }
 
   private getEditorBottomPaddingPx(editor: vscode.TextEditor): number {
-    const editorConfiguration = vscode.workspace.getConfiguration(
-      "editor",
-      editor.document.uri
-    );
-    const padding = editorConfiguration.get<{ bottom?: number }>("padding");
-    const bottomPadding = padding?.bottom ?? 0;
-    return Math.max(0, bottomPadding);
+    const layoutKey = this.getEditorConfigCacheKey(editor);
+    if (this.configCacheLayoutKey !== layoutKey || this.cachedBottomPaddingPx === undefined) {
+      this.refreshConfigCache(editor, layoutKey);
+    }
+
+    return this.cachedBottomPaddingPx!;
+  }
+
+  private invalidateConfigCache(): void {
+    this.configCacheLayoutKey = undefined;
+    this.cachedLineHeightPx = undefined;
+    this.cachedBottomPaddingPx = undefined;
   }
 
   private clearTopTabsDecorations(skipEditor?: vscode.TextEditor): void {
-    const editors = vscode.window.visibleTextEditors;
-    for (let index = 0; index < editors.length; index += 1) {
-      const editor = editors[index];
-      if (skipEditor && editor === skipEditor) {
-        continue;
-      }
-
-      editor.setDecorations(this.topTabsDecorationType, []);
-    }
-  }
-
-  private startLayoutRefreshInterval(): void {
-    if (this.layoutRefreshIntervalTimer) {
+    if (skipEditor) {
+      skipEditor.setDecorations(this.topTabsDecorationType, []);
       return;
     }
 
-    this.layoutRefreshIntervalTimer = setInterval(() => {
-      this.refreshVisibleTabsLayout();
+    const editors = vscode.window.visibleTextEditors;
+    for (let index = 0; index < editors.length; index += 1) {
+      editors[index].setDecorations(this.topTabsDecorationType, []);
+    }
+  }
+
+  private markTabsDirty(): void {
+    this.tabsDirty = true;
+  }
+
+  private startTabsPolling(): void {
+    if (this.tabsPollTimer) {
+      return;
+    }
+
+    this.tabsPollTimer = setInterval(() => {
+      this.pollTabsLayout();
     }, EditorBottomTabsDecorationController.frameDetectionIntervalMs);
   }
 
-  private scheduleTabsLayoutRefresh(delayMs: number): void {
-    if (this.layoutRefreshSyncTimer) {
-      clearTimeout(this.layoutRefreshSyncTimer);
+  private pollTabsLayout(): void {
+    if (!this.tabsDirty) {
+      return;
     }
 
-    this.layoutRefreshSyncTimer = setTimeout(() => {
-      this.layoutRefreshSyncTimer = undefined;
+    this.tabsDirty = false;
+    this.refreshVisibleTabsLayout();
+  }
+
+  private scheduleDeferredTabsRefresh(delayMs: number): void {
+    if (this.tabsDeferredTimer) {
+      clearTimeout(this.tabsDeferredTimer);
+    }
+
+    this.tabsDeferredTimer = setTimeout(() => {
+      this.tabsDeferredTimer = undefined;
       this.refreshVisibleTabsLayout();
     }, delayMs);
   }
 
-  private scheduleRefresh(delayMs: number): void {
-    if (this.refreshTimer) {
-      clearTimeout(this.refreshTimer);
+  private clearAllTabsTimers(): void {
+    this.tabsDirty = false;
+
+    if (this.tabsPollTimer) {
+      clearInterval(this.tabsPollTimer);
+      this.tabsPollTimer = undefined;
     }
 
-    this.refreshTimer = setTimeout(() => {
-      this.refreshTimer = undefined;
-      this.refresh();
-    }, delayMs);
-  }
-
-  private scheduleLateRefresh(delayMs: number): void {
-    if (this.lateRefreshTimer) {
-      clearTimeout(this.lateRefreshTimer);
+    if (this.tabsDeferredTimer) {
+      clearTimeout(this.tabsDeferredTimer);
+      this.tabsDeferredTimer = undefined;
     }
-
-    this.lateRefreshTimer = setTimeout(() => {
-      this.lateRefreshTimer = undefined;
-      this.refresh();
-    }, delayMs);
   }
 
   private refreshVisibleTabsLayout(): void {
@@ -759,42 +898,24 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     }
 
     const activeEditor = vscode.window.activeTextEditor;
-    if (activeEditor) {
-      this.updateViewportCapacityHistory(activeEditor);
-      this.updatePinnedOffsetForViewportChange(activeEditor);
+    if (!activeEditor) {
+      return;
     }
 
+    const topVisibleLine = this.getTopVisibleLine(activeEditor);
+    const visibleLineSlots = this.getVisibleLineSlots(activeEditor);
+    if (
+      this.lastIdleTopVisibleLine === topVisibleLine &&
+      this.lastIdleVisibleLineSlots === visibleLineSlots
+    ) {
+      return;
+    }
+
+    this.lastIdleTopVisibleLine = topVisibleLine;
+    this.lastIdleVisibleLineSlots = visibleLineSlots;
+    this.updateViewportCapacityHistory(activeEditor);
+    this.updatePinnedOffsetForViewportChange(activeEditor);
     this.refresh();
-  }
-
-  private clearRefreshTimers(): void {
-    if (this.refreshTimer) {
-      clearTimeout(this.refreshTimer);
-      this.refreshTimer = undefined;
-    }
-
-    if (this.lateRefreshTimer) {
-      clearTimeout(this.lateRefreshTimer);
-      this.lateRefreshTimer = undefined;
-    }
-  }
-
-  private clearTabsLayoutRefreshInterval(): void {
-    if (!this.layoutRefreshIntervalTimer) {
-      return;
-    }
-
-    clearInterval(this.layoutRefreshIntervalTimer);
-    this.layoutRefreshIntervalTimer = undefined;
-  }
-
-  private clearTabsLayoutRefreshTimer(): void {
-    if (!this.layoutRefreshSyncTimer) {
-      return;
-    }
-
-    clearTimeout(this.layoutRefreshSyncTimer);
-    this.layoutRefreshSyncTimer = undefined;
   }
 
   private setTabsVisibleContext(isVisible: boolean): void {

@@ -16,12 +16,12 @@ export async function activate(
 ): Promise<void> {
   const outputChannel = vscode.window.createOutputChannel("Quick Suggestion Filter");
   const filterService = new SuggestionFilterService(outputChannel);
-  const editorBottomTabsDecorationController =
-    new EditorBottomTabsDecorationController(filterService);
   suggestKindSettingsController = new SuggestKindSettingsController(
     context,
     outputChannel
   );
+  const editorBottomTabsDecorationController =
+    new EditorBottomTabsDecorationController(filterService, suggestKindSettingsController);
 
   const applyConfiguration = async (): Promise<void> => {
     filterService.applyConfiguration(loadExtensionConfig());
@@ -65,7 +65,7 @@ export async function activate(
       return;
     }
 
-    editorBottomTabsDecorationController.show();
+    editorBottomTabsDecorationController.showImmediate();
 
     await vscode.commands.executeCommand(
       "quickSuggestionFilter.triggerFilteredSuggest",
