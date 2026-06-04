@@ -1,0 +1,99 @@
+{
+  "name": "quick-suggestion-filter",
+  "displayName": "Quick Suggestion Filter",
+  "description": "A VS Code extension for keyboard-driven native suggest category switching.",
+  "version": "0.0.1",
+  "publisher": "RainWN",
+  "author": "RainWN",
+  "repository": "https://github.com/RainWN/quick-suggestion-filter",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "suggestion",
+    "completion",
+    "filter"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "quickSuggestionFilter.triggerFilteredSuggest",
+        "title": "Quick Suggestion Filter: Trigger Filtered Suggestions"
+      },
+      {
+        "command": "quickSuggestionFilter.hideSuggestAndTabs",
+        "title": "Quick Suggestion Filter: Hide Suggest And Tabs"
+      },
+      {
+        "command": "quickSuggestionFilter.selectPreviousCategory",
+        "title": "Quick Suggestion Filter: Select Previous Category"
+      },
+      {
+        "command": "quickSuggestionFilter.selectNextCategory",
+        "title": "Quick Suggestion Filter: Select Next Category"
+      },
+      {
+        "command": "quickSuggestionFilter.showStatus",
+        "title": "Quick Suggestion Filter: Show Status"
+      },
+      {
+        "command": "quickSuggestionFilter.reloadConfiguration",
+        "title": "Quick Suggestion Filter: Reload Configuration"
+      }
+    ],
+    "configuration": {
+      "title": "Quick Suggestion Filter",
+      "properties": {
+        "quickSuggestionFilter.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the quick suggestion filter extension runtime."
+        },
+        "quickSuggestionFilter.logLevel": {
+          "type": "string",
+          "default": "info",
+          "enum": [
+            "error",
+            "info",
+            "debug"
+          ],
+          "description": "Controls extension logging verbosity."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "quickSuggestionFilter.selectPreviousCategory",
+        "key": "pageup",
+        "when": "editorTextFocus && quickSuggestionFilter.enabled && quickSuggestionFilter.tabsVisible"
+      },
+      {
+        "command": "quickSuggestionFilter.selectNextCategory",
+        "key": "pagedown",
+        "when": "editorTextFocus && quickSuggestionFilter.enabled && quickSuggestionFilter.tabsVisible"
+      },
+      {
+        "command": "quickSuggestionFilter.hideSuggestAndTabs",
+        "key": "escape",
+        "when": "editorTextFocus && quickSuggestionFilter.enabled && quickSuggestionFilter.tabsVisible"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}
