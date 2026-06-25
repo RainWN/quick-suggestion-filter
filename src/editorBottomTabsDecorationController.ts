@@ -639,7 +639,7 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     return Math.max(
       0,
       Math.round(
-        visibleLineSlotsInfo.effectiveVisibleLineSlots * lineHeightPx -
+        (visibleLineSlotsInfo.effectiveVisibleLineSlots - 1) * lineHeightPx -
           this.getVisualTabsBarHeightPx() -
           bottomPaddingPx
       )
