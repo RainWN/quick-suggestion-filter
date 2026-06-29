@@ -26,13 +26,6 @@ interface TriggerAnchorState {
   position: vscode.Position;
 }
 
-interface VisibleLineSlotsInfo {
-  currentVisibleLineSlots: number;
-  maxVisibleLineSlots: number;
-  compensationLineSlots: number;
-  effectiveVisibleLineSlots: number;
-}
-
 export class EditorBottomTabsDecorationController implements vscode.Disposable {
   private static readonly frameDetectionIntervalMs = 16;
   private static readonly barPaddingX = 10;
@@ -61,15 +54,11 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   private triggerAnchorState?: TriggerAnchorState;
   private pinnedVerticalOffsetPx?: number;
   private pinnedViewportTopLine?: number;
-  private viewportCapacityLayoutKey?: string;
-  private maxVisibleLineSlots?: number;
   private lastAppliedLayoutKey?: string;
   private lastIdleTopVisibleLine?: number;
-  private lastIdleVisibleLineSlots?: number;
   private svgTemplateCacheKey?: string;
   private svgTemplateCache?: string;
   private cachedLineHeightPx?: number;
-  private cachedBottomPaddingPx?: number;
   private configCacheLayoutKey?: string;
   private showDeferredAnchor?: vscode.Position;
   private showDeferredTimer?: NodeJS.Timeout;
@@ -80,17 +69,9 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   ) {
     this.setTabsVisibleContext(false);
 
-    const activeEditor = vscode.window.activeTextEditor;
-    if (activeEditor) {
-      this.updateViewportCapacityHistory(activeEditor);
-    }
-
     this.subscriptions.push(
-      vscode.window.onDidChangeActiveTextEditor((editor) => {
+      vscode.window.onDidChangeActiveTextEditor(() => {
         this.invalidateConfigCache();
-        if (editor) {
-          this.updateViewportCapacityHistory(editor);
-        }
 
         if (this.isVisible) {
           this.hide();
@@ -126,7 +107,6 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
           return;
         }
 
-        this.updateViewportCapacityHistory(event.textEditor);
         if (this.isVisible) {
           this.markTabsDirty();
           this.updatePinnedOffsetForViewportChange(event.textEditor);
@@ -135,18 +115,15 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
       }),
       vscode.workspace.onDidChangeConfiguration((event) => {
         const activeEditor = vscode.window.activeTextEditor;
-        const affectsViewportLayout =
+        const affectsLayout =
           event.affectsConfiguration("editor.fontSize", activeEditor?.document) ||
-          event.affectsConfiguration("editor.lineHeight", activeEditor?.document) ||
-          event.affectsConfiguration("editor.padding", activeEditor?.document) ||
-          event.affectsConfiguration("window.zoomLevel");
+          event.affectsConfiguration("editor.lineHeight", activeEditor?.document);
 
-        if (!affectsViewportLayout) {
+        if (!affectsLayout) {
           return;
         }
 
         this.invalidateConfigCache();
-        this.resetViewportCapacityHistory(activeEditor);
         this.invalidateTabsBarCache();
         if (this.isVisible && activeEditor) {
           this.pinVerticalOffset(activeEditor);
@@ -190,7 +167,6 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     const wasVisible = this.isVisible;
     const activeEditor = vscode.window.activeTextEditor;
     if (activeEditor) {
-      this.updateViewportCapacityHistory(activeEditor);
       this.captureTriggerAnchor(
         activeEditor,
         anchorPosition ?? this.getActiveAnchorPosition(activeEditor)
@@ -233,7 +209,6 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     this.pinnedViewportTopLine = undefined;
     this.lastAppliedLayoutKey = undefined;
     this.lastIdleTopVisibleLine = undefined;
-    this.lastIdleVisibleLineSlots = undefined;
     this.showDeferredAnchor = undefined;
     if (this.showDeferredTimer) {
       clearTimeout(this.showDeferredTimer);
@@ -633,17 +608,7 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   }
 
   private getVerticalOffsetPx(editor: vscode.TextEditor): number {
-    const lineHeightPx = this.getEffectiveLineHeight(editor);
-    const visibleLineSlotsInfo = this.getStableVisibleLineSlotsInfo(editor);
-    const bottomPaddingPx = this.getEditorBottomPaddingPx(editor);
-    return Math.max(
-      0,
-      Math.round(
-        (visibleLineSlotsInfo.effectiveVisibleLineSlots - 1) * lineHeightPx -
-          this.getVisualTabsBarHeightPx() -
-          bottomPaddingPx
-      )
-    );
+    return 3 * this.getEffectiveLineHeight(editor);
   }
 
   private getPinnedVerticalOffsetPx(editor: vscode.TextEditor): number {
@@ -655,7 +620,6 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
   }
 
   private pinVerticalOffset(editor: vscode.TextEditor): void {
-    this.updateViewportCapacityHistory(editor);
     this.pinnedVerticalOffsetPx = this.getVerticalOffsetPx(editor);
     this.pinnedViewportTopLine = this.getTopVisibleLine(editor);
     this.lastAppliedLayoutKey = undefined;
@@ -704,82 +668,6 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     return nearestLine;
   }
 
-  private getVisibleLineSlots(editor: vscode.TextEditor): number {
-    const visibleRanges = editor.visibleRanges;
-    if (visibleRanges.length === 0) {
-      return 1;
-    }
-
-    let visibleLineSlots = 0;
-    for (let index = 0; index < visibleRanges.length; index += 1) {
-      const range = visibleRanges[index];
-      const startLine = range.start.line;
-      const endLineExclusive = Math.max(startLine + 1, range.end.line);
-      visibleLineSlots += endLineExclusive - startLine;
-    }
-
-    return Math.max(1, visibleLineSlots);
-  }
-
-  private getStableVisibleLineSlotsInfo(
-    editor: vscode.TextEditor
-  ): VisibleLineSlotsInfo {
-    this.updateViewportCapacityHistory(editor);
-    const currentVisibleLineSlots = this.getVisibleLineSlots(editor);
-    const maxVisibleLineSlots = Math.max(
-      currentVisibleLineSlots,
-      this.maxVisibleLineSlots ?? currentVisibleLineSlots
-    );
-    const compensationLineSlots = Math.max(
-      0,
-      maxVisibleLineSlots - currentVisibleLineSlots
-    );
-
-    return {
-      currentVisibleLineSlots,
-      maxVisibleLineSlots,
-      compensationLineSlots,
-      effectiveVisibleLineSlots: currentVisibleLineSlots + compensationLineSlots,
-    };
-  }
-
-  private updateViewportCapacityHistory(editor: vscode.TextEditor): void {
-    const currentVisibleLineSlots = this.getVisibleLineSlots(editor);
-    const layoutKey = this.getViewportCapacityLayoutKey(editor);
-    if (this.viewportCapacityLayoutKey !== layoutKey) {
-      this.viewportCapacityLayoutKey = layoutKey;
-      this.maxVisibleLineSlots = currentVisibleLineSlots;
-      return;
-    }
-
-    if (
-      this.maxVisibleLineSlots === undefined ||
-      currentVisibleLineSlots > this.maxVisibleLineSlots
-    ) {
-      this.maxVisibleLineSlots = currentVisibleLineSlots;
-    }
-  }
-
-  private resetViewportCapacityHistory(editor?: vscode.TextEditor): void {
-    this.viewportCapacityLayoutKey = undefined;
-    this.maxVisibleLineSlots = undefined;
-    if (editor) {
-      this.updateViewportCapacityHistory(editor);
-    }
-  }
-
-  private getViewportCapacityLayoutKey(editor: vscode.TextEditor): string {
-    const zoomLevel = vscode.workspace
-      .getConfiguration("window")
-      .get<number>("zoomLevel", 0);
-    return [
-      editor.viewColumn ?? -1,
-      this.getEffectiveLineHeight(editor),
-      this.getEditorBottomPaddingPx(editor),
-      zoomLevel,
-    ].join("|");
-  }
-
   private getEffectiveLineHeight(editor: vscode.TextEditor): number {
     const layoutKey = this.getEditorConfigCacheKey(editor);
     if (this.configCacheLayoutKey !== layoutKey || this.cachedLineHeightPx === undefined) {
@@ -813,23 +701,11 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
       this.cachedLineHeightPx = Math.max(fontSize + 8, Math.round(fontSize * 1.5));
     }
 
-    const padding = editorConfiguration.get<{ bottom?: number }>("padding");
-    this.cachedBottomPaddingPx = Math.max(0, padding?.bottom ?? 0);
-  }
-
-  private getEditorBottomPaddingPx(editor: vscode.TextEditor): number {
-    const layoutKey = this.getEditorConfigCacheKey(editor);
-    if (this.configCacheLayoutKey !== layoutKey || this.cachedBottomPaddingPx === undefined) {
-      this.refreshConfigCache(editor, layoutKey);
-    }
-
-    return this.cachedBottomPaddingPx!;
   }
 
   private invalidateConfigCache(): void {
     this.configCacheLayoutKey = undefined;
     this.cachedLineHeightPx = undefined;
-    this.cachedBottomPaddingPx = undefined;
   }
 
   private clearTopTabsDecorations(skipEditor?: vscode.TextEditor): void {
@@ -903,17 +779,11 @@ export class EditorBottomTabsDecorationController implements vscode.Disposable {
     }
 
     const topVisibleLine = this.getTopVisibleLine(activeEditor);
-    const visibleLineSlots = this.getVisibleLineSlots(activeEditor);
-    if (
-      this.lastIdleTopVisibleLine === topVisibleLine &&
-      this.lastIdleVisibleLineSlots === visibleLineSlots
-    ) {
+    if (this.lastIdleTopVisibleLine === topVisibleLine) {
       return;
     }
 
     this.lastIdleTopVisibleLine = topVisibleLine;
-    this.lastIdleVisibleLineSlots = visibleLineSlots;
-    this.updateViewportCapacityHistory(activeEditor);
     this.updatePinnedOffsetForViewportChange(activeEditor);
     this.refresh();
   }
